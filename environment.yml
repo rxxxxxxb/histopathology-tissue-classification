@@ -1,0 +1,24 @@
+name: tissue-classification
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - jupyterlab
+  - ipykernel
+  - pytorch
+  - torchvision
+  - pytorch-cuda=12.1
+  - tifffile
+  - pillow
+  - tqdm
+  - pyyaml
+  - scikit-image
