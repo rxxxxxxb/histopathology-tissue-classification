@@ -10,4 +10,13 @@ conda env create -f environment.yml
 conda activate tissue-classification
 ```
 
+## Project structure
 
+```text
+histopathology-tissue-classification/
+├── README.md
+├── environment.yml
+├── tissue.py                           # Core library 
+├── classification_walkthrough.ipynb    # 
+└── scripts/                            # 
+```
