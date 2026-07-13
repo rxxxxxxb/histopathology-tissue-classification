@@ -1,7 +1,27 @@
 # Histopathology Tissue Classification
 
-Deep learning pipeline for classifying histopathology tissue patches, built around rigorous cross-validation on a small dataset (n≈400) and ablation studies comparing domain-specific augmentations.
+Deep learning pipeline for classifying H&E-stained tissue patches into 4 classes, built
+around stratified 5-fold cross-validation on a small dataset (n=400) and an ablation
+study comparing preprocessing/augmentation choices.
 
+**TL;DR**
+
+- **Task.** 4-class H&E tissue classification, *n* = 400 (100 per class), image-level labels at 2048×1536.
+- **Best model.** ResNet-50 (ImageNet-pretrained) + classic resize-224 pipeline.
+- **Result.** Macro-F1 **0.898 ± 0.033** on stratified 5-fold CV with held-out predictions for every image.
+- **Most informative finding.** The ablation (`04.`) overturned the preprocessing (`02.`) "crop-over-resize" prior — the smaller, ImageNet-native resolution beat the higher-res crop.
+- **Where to look:**
+  - `01. eda_walkthrough.ipynb` — bit-depth audit, data sanity check, leakage analysis (visual + TIFF metadata)
+  - `02. preprocessing_walkthrough.ipynb` — normalization, crop-vs-resize, augmentation choices
+  - `03. model_training_walkthrough.ipynb` — main 5-fold CV with the full training protocol
+  - `04. ablation_walkthrough.ipynb` — resize-224 vs. crop-512 vs. crop-512 + HED jitter
+  - `05. evaluation_walkthrough.ipynb` — confusion matrix, per-class P/R/F1, failure gallery, Grad-CAM, summary
+
+## Results
+
+![Confusion matrix — held-out predictions](assets/confusion_matrix.png)
+
+![Grad-CAM — what the model looks at, two correct and two wrong predictions](assets/gradcam.jpg)
 
 ## Setup
 
@@ -10,13 +30,24 @@ conda env create -f environment.yml
 conda activate tissue-classification
 ```
 
+The raw TIFF dataset is not included in this repo — place it under `data/<class_name>/*.tif`
+to run the notebooks yourself.
+
 ## Project structure
 
 ```text
 histopathology-tissue-classification/
-├── README.md
+├── 01. eda_walkthrough.ipynb             # data & leakage audit
+├── 02. preprocessing_walkthrough.ipynb   # preprocessing & augmentation
+├── 03. model_training_walkthrough.ipynb  # model & 5-fold CV training
+├── 04. ablation_walkthrough.ipynb        # resize-vs-crop-vs-HED ablation
+├── 05. evaluation_walkthrough.ipynb      # evaluation, diagnostics, summary
+├── tissue.py                             # shared library: data loading, model, training, eval
+├── scripts/                              # headless CV/ablation runners, built on tissue.py
 ├── environment.yml
-├── tissue.py                           # Core library 
-├── classification_walkthrough.ipynb    # 
-└── scripts/                            # 
+└── LICENSE
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
