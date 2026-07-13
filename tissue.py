@@ -4,9 +4,9 @@ This module is built up incrementally alongside the per-section walkthrough
 notebooks: each commit adds only the utilities needed by the notebook it
 supports, so the git history mirrors how the pipeline grew section by section.
 
-Currently covers data loading/preprocessing (used by
-``preprocessing_walkthrough.ipynb``) and model building/training (used by the
-upcoming model-and-training walkthrough notebook):
+Currently covers data loading/preprocessing, model building/training, and the
+resize-vs-crop-vs-HED-jitter ablation (used by ``preprocessing_walkthrough.ipynb``,
+the model-and-training walkthrough, and the upcoming ablation walkthrough):
     * Constants — class names, ImageNet normalization stats.
     * ``load_image`` — TIFF loader with the 16-bit → 8-bit rescale.
     * ``encode_labels`` — class name -> integer label encoding.
@@ -19,9 +19,15 @@ upcoming model-and-training walkthrough notebook):
     * ``TrainConfig`` — single source of truth for training hyperparameters.
     * ``train_one_fold`` / ``run_cv`` — training loop and StratifiedKFold wrapper.
     * ``save_cv_results`` / ``load_cv_metrics`` — persistence for the CV run.
+    * ``HEDColorJitter`` — Tellez-style stain-aware colour jitter augmentation.
+    * ``build_train_transforms_resize224`` / ``build_eval_transforms_resize224`` —
+      classic ImageNet resize/crop pipeline, the ablation baseline.
+    * ``build_train_transforms_hed`` — main pipeline + HED jitter, for the ablation.
+    * ``AblationVariant`` / ``run_ablation`` — declare and run each ablation row,
+      with per-variant checkpoint caching.
 
-Ablation variants and evaluation/diagnostics utilities (Grad-CAM, held-out
-prediction collection) will land here as those sections are split out.
+Evaluation/diagnostics utilities (Grad-CAM, held-out prediction collection) will
+land here as that section is split out.
 """
 
 from __future__ import annotations
@@ -492,4 +498,174 @@ def load_cv_metrics(out_dir: PathLike) -> Optional[dict[str, Any]]:
         return None
     with open(path) as f:
         return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# §4 Ablation — extra transforms and a thin runner
+# ---------------------------------------------------------------------------
+
+
+class HEDColorJitter:
+    """Tellez-style HED stain-aware colour jitter.
+
+    Converts ``RGB`` → ``HED`` (haematoxylin / eosin / DAB) via a fixed stain matrix,
+    applies a per-channel multiplicative ``alpha`` and additive ``beta`` perturbation,
+    then converts back.
+
+    **Why HED over RGB jitter.** H&E stain intensity varies meaningfully across
+    scanners, laboratories, and batches — but that variation lives on axes aligned
+    with *stain concentrations*, not with the RGB axes of a display. Perturbing in
+    HED space simulates the real source of colour variability. Perturbing in RGB
+    space (``ColorJitter``) can produce colour combinations that do not exist in real
+    H&E images (e.g. green tissue), which is net-harmful as augmentation.
+
+    Reference: Tellez et al., 2019, *Quantifying the effects of data augmentation and
+    stain colour normalization in convolutional neural networks for computational
+    pathology*.
+    """
+
+    def __init__(self, alpha: float = 0.05, beta: float = 0.05) -> None:
+        # Lazy import so that skimage only becomes a hard dep when this is used.
+        from skimage.color import rgb2hed, hed2rgb
+
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self._rgb2hed = rgb2hed
+        self._hed2rgb = hed2rgb
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        hed = self._rgb2hed(arr)
+        for c in range(3):
+            a = np.random.uniform(1.0 - self.alpha, 1.0 + self.alpha)
+            b = np.random.uniform(-self.beta, self.beta)
+            hed[..., c] = hed[..., c] * a + b
+        rgb = np.clip(self._hed2rgb(hed), 0.0, 1.0)
+        return Image.fromarray((rgb * 255.0).astype(np.uint8))
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(alpha={self.alpha}, beta={self.beta})"
+
+
+def build_train_transforms_resize224(_crop_size_unused: int = 512) -> Callable:
+    """Classic ImageNet-style pipeline: resize to 256 then random-crop 224.
+
+    Used as the ablation baseline to quantify the crop-vs-resize claim. The train
+    pipeline still has a random-crop augmentation (so we're not unfairly handicapping
+    it by stripping augmentation) — the only difference from the main pipeline is the
+    **effective resolution**: 224 px after a 2048→256 down-scale vs. 512 px native.
+
+    The ``_crop_size_unused`` parameter is present only so the signature matches the
+    shape of other builders passed into ``run_cv``.
+    """
+    return T.Compose(
+        [
+            T.Resize(256),
+            T.RandomCrop(224),
+            T.RandomHorizontalFlip(),
+            T.RandomVerticalFlip(),
+            DiscreteRotation90(),
+            T.ToTensor(),
+            T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ]
+    )
+
+
+def build_eval_transforms_resize224(_crop_size_unused: int = 512) -> Callable:
+    """Eval-side counterpart: resize to 256, centre-crop 224 (standard ImageNet eval)."""
+    return T.Compose(
+        [
+            T.Resize(256),
+            T.CenterCrop(224),
+            T.ToTensor(),
+            T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ]
+    )
+
+
+def build_train_transforms_hed(crop_size: int = 512) -> Callable:
+    """Main pipeline + HED stain jitter.
+
+    HED jitter is applied *after* ``RandomCrop`` — there's no reason to pay the
+    skimage colour-conversion cost on pixels we're about to throw away — and *before*
+    ``ToTensor``, because :class:`HEDColorJitter` expects a PIL image.
+    """
+    return T.Compose(
+        [
+            T.RandomCrop(crop_size),
+            T.RandomHorizontalFlip(),
+            T.RandomVerticalFlip(),
+            DiscreteRotation90(),
+            HEDColorJitter(alpha=0.05, beta=0.05),
+            T.ToTensor(),
+            T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ]
+    )
+
+
+@dataclass
+class AblationVariant:
+    """One row in the ablation table.
+
+    Attributes:
+        name: Short slug used as the subdirectory name for saved checkpoints.
+        label: Display name for the results table.
+        train_builder: Function ``(crop_size) -> Compose`` producing the train transform.
+        eval_builder: Function ``(crop_size) -> Compose`` producing the eval transform.
+        crop_size: Passed to the builders (ignored by the resize-224 builders).
+    """
+
+    name: str
+    label: str
+    train_builder: Callable[[int], Callable]
+    eval_builder: Callable[[int], Callable]
+    crop_size: int = 512
+
+
+def run_ablation(
+    paths: Sequence[PathLike],
+    labels: Sequence[int],
+    cfg: TrainConfig,
+    variants: Sequence[AblationVariant],
+    out_root: PathLike = Path("checkpoints"),
+    device: Optional[torch.device] = None,
+    progress: Optional[Callable[[str], None]] = None,
+) -> dict[str, dict[str, Any]]:
+    """Run Stratified 5-fold CV for each variant and return ``{name: metrics_dict}``.
+
+    Each variant is persisted to ``<out_root>/<name>/`` via :func:`save_cv_results`, so
+    that re-running the notebook doesn't retrain any variant whose metrics already
+    exist on disk. The special name ``"main"`` reuses the top-level ``<out_root>/``
+    directory where §3 wrote its results.
+    """
+    log = progress if progress is not None else print
+    device = device or pick_device()
+    out_root = Path(out_root)
+    results: dict[str, dict[str, Any]] = {}
+
+    from dataclasses import replace as _replace
+
+    for v in variants:
+        out_dir = out_root if v.name == "main" else out_root / v.name
+        cached = load_cv_metrics(out_dir)
+        if cached is not None:
+            log(f"[{v.label}] cached at {out_dir}/metrics.json — skipping")
+            results[v.name] = cached
+            continue
+
+        log(f"\n[{v.label}] running {cfg.n_splits}-fold CV (saving to {out_dir}/)")
+        v_cfg = _replace(cfg, crop_size=v.crop_size)
+        cv = run_cv(
+            paths,
+            labels,
+            v_cfg,
+            transform_builder=v.train_builder,
+            eval_transform_builder=v.eval_builder,
+            device=device,
+            progress=log,
+        )
+        save_cv_results(cv, out_dir)
+        results[v.name] = load_cv_metrics(out_dir)
+
+    return results
 
