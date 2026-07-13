@@ -4,9 +4,10 @@ This module is built up incrementally alongside the per-section walkthrough
 notebooks: each commit adds only the utilities needed by the notebook it
 supports, so the git history mirrors how the pipeline grew section by section.
 
-Currently covers data loading/preprocessing, model building/training, and the
-resize-vs-crop-vs-HED-jitter ablation (used by ``preprocessing_walkthrough.ipynb``,
-the model-and-training walkthrough, and the upcoming ablation walkthrough):
+Currently covers data loading/preprocessing, model building/training, the
+resize-vs-crop-vs-HED-jitter ablation, and held-out evaluation/diagnostics (used by
+``preprocessing_walkthrough.ipynb``, ``model_training_walkthrough.ipynb``,
+``ablation_walkthrough.ipynb``, and ``evaluation_walkthrough.ipynb``):
     * Constants — class names, ImageNet normalization stats.
     * ``load_image`` — TIFF loader with the 16-bit → 8-bit rescale.
     * ``encode_labels`` — class name -> integer label encoding.
@@ -25,9 +26,11 @@ the model-and-training walkthrough, and the upcoming ablation walkthrough):
     * ``build_train_transforms_hed`` — main pipeline + HED jitter, for the ablation.
     * ``AblationVariant`` / ``run_ablation`` — declare and run each ablation row,
       with per-variant checkpoint caching.
-
-Evaluation/diagnostics utilities (Grad-CAM, held-out prediction collection) will
-land here as that section is split out.
+    * ``collect_cv_predictions`` — CV wrapper that also returns per-image held-out
+      predictions (probabilities, argmax, and the fold each prediction came from).
+    * ``save_cv_predictions`` / ``load_cv_predictions`` — persistence for those
+      held-out predictions (``predictions.npz``).
+    * ``GradCAM`` — minimal Grad-CAM implementation for a single named layer.
 """
 
 from __future__ import annotations
@@ -668,4 +671,210 @@ def run_ablation(
         results[v.name] = load_cv_metrics(out_dir)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# §5 Diagnostics — held-out prediction collection and Grad-CAM
+# ---------------------------------------------------------------------------
+
+
+def _predict_on_loader(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run softmax inference on a loader. Returns (probs NxC, preds N)."""
+    model.eval()
+    prob_chunks: list[np.ndarray] = []
+    with torch.no_grad():
+        for x, _ in loader:
+            x = x.to(device, non_blocking=True)
+            logits = model(x)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            prob_chunks.append(probs)
+    probs = np.concatenate(prob_chunks, axis=0)
+    preds = probs.argmax(axis=1)
+    return probs, preds
+
+
+def collect_cv_predictions(
+    paths: Sequence[PathLike],
+    labels: Sequence[int],
+    cfg: TrainConfig,
+    transform_builder: Callable[[int], Callable] = build_train_transforms,
+    eval_transform_builder: Optional[Callable[[int], Callable]] = None,
+    device: Optional[torch.device] = None,
+    progress: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    """Run Stratified K-fold CV and **also** collect per-image held-out predictions.
+
+    For every image, the prediction comes from the fold in which it was in the
+    validation split — so the returned arrays are a true cross-validated prediction
+    set over all ``N`` images, with no training-set contamination.
+
+    Returns a dict with all of :func:`run_cv`'s keys plus:
+        - ``y_true`` (N,) int64 — ground-truth labels
+        - ``y_pred`` (N,) int64 — predicted labels (argmax of ``probs``)
+        - ``probs``  (N, C) float32 — softmax probabilities
+        - ``fold_of`` (N,) int64 — which fold each image's prediction came from
+
+    Arrays are in the original index order of ``paths``.
+    """
+    device = device or pick_device()
+    log = progress if progress is not None else print
+    eval_builder = eval_transform_builder or build_eval_transforms
+    y_all = np.asarray(labels, dtype=np.int64)
+    n = len(paths)
+    num_classes = len(CLASSES)
+
+    y_pred = np.full(n, -1, dtype=np.int64)
+    probs = np.zeros((n, num_classes), dtype=np.float32)
+    fold_of = np.full(n, -1, dtype=np.int64)
+
+    skf = StratifiedKFold(n_splits=cfg.n_splits, shuffle=True, random_state=cfg.seed)
+    fold_results: list[dict[str, Any]] = []
+    splits: list[dict[str, list[int]]] = []
+
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(np.arange(n), y_all)):
+        log(f"\n=== Fold {fold_idx + 1}/{cfg.n_splits}  (train={len(train_idx)}, val={len(val_idx)}) ===")
+        set_seed(cfg.seed + fold_idx)
+
+        train_ds = TissueDataset(
+            [paths[i] for i in train_idx],
+            [labels[i] for i in train_idx],
+            transform=transform_builder(cfg.crop_size),
+        )
+        val_ds = TissueDataset(
+            [paths[i] for i in val_idx],
+            [labels[i] for i in val_idx],
+            transform=eval_builder(cfg.crop_size),
+        )
+
+        result = train_one_fold(train_ds, val_ds, cfg, device=device, progress=log)
+        result["fold"] = fold_idx
+        fold_results.append(result)
+        splits.append({"train_idx": train_idx.tolist(), "val_idx": val_idx.tolist()})
+
+        model = build_model(num_classes=num_classes).to(device)
+        model.load_state_dict(result["best_state"])
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+        fold_probs, fold_preds = _predict_on_loader(model, val_loader, device)
+        for local_i, global_i in enumerate(val_idx):
+            probs[global_i] = fold_probs[local_i]
+            y_pred[global_i] = fold_preds[local_i]
+            fold_of[global_i] = fold_idx
+
+        log(
+            f"  fold {fold_idx + 1} best: "
+            f"acc={result['best_metrics']['accuracy']:.3f} "
+            f"macroF1={result['best_metrics']['macro_f1']:.3f}"
+        )
+
+    summary_keys = ("accuracy", "balanced_accuracy", "macro_f1")
+    summary = {
+        k: {
+            "mean": float(np.mean([r["best_metrics"][k] for r in fold_results])),
+            "std": float(np.std([r["best_metrics"][k] for r in fold_results])),
+            "per_fold": [r["best_metrics"][k] for r in fold_results],
+        }
+        for k in summary_keys
+    }
+    best_idx = int(np.argmax([r["best_metrics"]["macro_f1"] for r in fold_results]))
+
+    return {
+        "fold_results": fold_results,
+        "summary": summary,
+        "splits": splits,
+        "best_fold": best_idx,
+        "cfg": asdict(cfg),
+        "y_true": y_all,
+        "y_pred": y_pred,
+        "probs": probs,
+        "fold_of": fold_of,
+    }
+
+
+def save_cv_predictions(results: dict[str, Any], out_dir: PathLike) -> None:
+    """Persist held-out predictions from :func:`collect_cv_predictions` as ``predictions.npz``."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        out / "predictions.npz",
+        y_true=results["y_true"],
+        y_pred=results["y_pred"],
+        probs=results["probs"],
+        fold_of=results["fold_of"],
+    )
+
+
+def load_cv_predictions(out_dir: PathLike) -> Optional[dict[str, np.ndarray]]:
+    """Load ``predictions.npz`` if present, else ``None``."""
+    path = Path(out_dir) / "predictions.npz"
+    if not path.exists():
+        return None
+    with np.load(path) as f:
+        return {k: f[k] for k in f.files}
+
+
+class GradCAM:
+    """Minimal Grad-CAM for a single named layer.
+
+    Usage::
+
+        cam = GradCAM(model, target_layer=model.layer4[-1])
+        heatmap = cam(input_tensor, target_class=3)  # HxW in [0, 1]
+        cam.close()
+
+    The implementation follows Selvaraju et al., 2017: it hooks the *activations*
+    and *gradients* of a chosen convolutional layer, weights each activation map
+    by the global-average of its gradient wrt the target class score, and sums +
+    ReLUs the result. The output is up-sampled to the input spatial size and
+    normalized to ``[0, 1]`` for overlay.
+
+    We bind to ``layer4[-1]`` (last bottleneck of ResNet) by default — that's the
+    highest-resolution feature map with strong class-discriminative signal.
+    """
+
+    def __init__(self, model: nn.Module, target_layer: nn.Module) -> None:
+        self.model = model
+        self._activations: Optional[torch.Tensor] = None
+        self._gradients: Optional[torch.Tensor] = None
+        self._fh = target_layer.register_forward_hook(self._save_activation)
+        self._bh = target_layer.register_full_backward_hook(self._save_gradient)
+
+    def _save_activation(self, _mod, _inp, out) -> None:
+        self._activations = out.detach()
+
+    def _save_gradient(self, _mod, _grad_in, grad_out) -> None:
+        self._gradients = grad_out[0].detach()
+
+    def __call__(self, x: torch.Tensor, target_class: int) -> np.ndarray:
+        self.model.eval()
+        self.model.zero_grad()
+        logits = self.model(x)
+        score = logits[:, target_class].sum()
+        score.backward(retain_graph=False)
+
+        if self._activations is None or self._gradients is None:
+            raise RuntimeError("hooks did not fire; is target_layer on the forward path?")
+        # weights: (B, C) from global-avg-pool of gradients over spatial dims
+        weights = self._gradients.mean(dim=(2, 3), keepdim=True)  # (B, C, 1, 1)
+        cam = (weights * self._activations).sum(dim=1, keepdim=True)  # (B, 1, H, W)
+        cam = torch.relu(cam)
+        cam = F.interpolate(cam, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        cam = cam.squeeze(0).squeeze(0).cpu().numpy()
+        # Normalise to [0, 1]; avoid div-by-zero for all-negative activations.
+        cam -= cam.min()
+        m = cam.max()
+        return cam / m if m > 0 else cam
+
+    def close(self) -> None:
+        self._fh.remove()
+        self._bh.remove()
 
