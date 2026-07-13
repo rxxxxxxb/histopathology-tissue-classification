@@ -4,8 +4,9 @@ This module is built up incrementally alongside the per-section walkthrough
 notebooks: each commit adds only the utilities needed by the notebook it
 supports, so the git history mirrors how the pipeline grew section by section.
 
-Currently covers data loading and preprocessing (used by
-``preprocessing_walkthrough.ipynb``):
+Currently covers data loading/preprocessing (used by
+``preprocessing_walkthrough.ipynb``) and model building/training (used by the
+upcoming model-and-training walkthrough notebook):
     * Constants — class names, ImageNet normalization stats.
     * ``load_image`` — TIFF loader with the 16-bit → 8-bit rescale.
     * ``encode_labels`` — class name -> integer label encoding.
@@ -13,22 +14,38 @@ Currently covers data loading and preprocessing (used by
     * ``build_train_transforms`` / ``build_eval_transforms`` — pipelines for training and
       for single-tile evaluation.
     * ``TissueDataset`` — thin ``torch.utils.data.Dataset`` wrapping ``(path, label)`` pairs.
+    * ``set_seed`` / ``pick_device`` — reproducibility and device selection helpers.
+    * ``build_model`` — ResNet-50 with ImageNet weights, head swapped for N classes.
+    * ``TrainConfig`` — single source of truth for training hyperparameters.
+    * ``train_one_fold`` / ``run_cv`` — training loop and StratifiedKFold wrapper.
+    * ``save_cv_results`` / ``load_cv_metrics`` — persistence for the CV run.
 
-Model-building, the CV training loop, ablation variants, and evaluation/diagnostics
-utilities will land here as the corresponding walkthrough sections are split out.
+Ablation variants and evaluation/diagnostics utilities (Grad-CAM, held-out
+prediction collection) will land here as those sections are split out.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import random
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Sequence, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as tvm
 import torchvision.transforms.functional as TF
+import yaml
 from PIL import Image
-from torch.utils.data import Dataset
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
+from sklearn.model_selection import StratifiedKFold
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 
 PathLike = Union[str, Path]
@@ -163,3 +180,316 @@ class TissueDataset(Dataset):
         if self.transform is not None:
             x = self.transform(x)
         return x, self.labels[idx]
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility and device
+# ---------------------------------------------------------------------------
+
+
+def set_seed(seed: int) -> None:
+    """Seed Python, NumPy, and torch (CPU + CUDA). Also force deterministic cuDNN."""
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def pick_device() -> torch.device:
+    """Return the best available device: CUDA → MPS → CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+
+def build_model(num_classes: int = 4) -> nn.Module:
+    """ResNet-50 with ImageNet-V2 weights, ``fc`` swapped for ``num_classes`` outputs.
+
+    Why ResNet-50: well-understood, right capacity for ``n = 400``, self-contained
+    ImageNet weights (no auth or extra dependencies). Pathology-SSL foundation models
+    (UNI / Virchow / CTransPath / Lunit-DINO) are the obvious next step — see Future
+    Work in the README.
+    """
+    model = tvm.resnet50(weights=tvm.ResNet50_Weights.IMAGENET1K_V2)
+    in_features = model.fc.in_features
+    model.fc = nn.Linear(in_features, num_classes)
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TrainConfig:
+    """Single source of truth for training hyperparameters.
+
+    Both the notebook (single-fold demo) and ``train.py`` (full CV) read from this.
+    """
+
+    epochs: int = 30
+    batch_size: int = 16
+    lr: float = 1e-4
+    weight_decay: float = 1e-4
+    patience: int = 7  # early-stopping patience on val macro-F1
+    crop_size: int = 512
+    num_workers: int = 4
+    seed: int = 42
+    n_splits: int = 5
+
+
+def _batch_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "macro_f1": float(f1_score(y_true, y_pred, average="macro")),
+    }
+
+
+def train_one_fold(
+    train_ds: "TissueDataset",
+    val_ds: "TissueDataset",
+    cfg: TrainConfig,
+    device: Optional[torch.device] = None,
+    progress: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    """Train a fresh ResNet-50 on one fold.
+
+    Returns a dict with ``history`` (per-epoch train/val loss and val metrics),
+    ``best_state`` (model state_dict of the best epoch by val macro-F1) and
+    ``best_metrics``.
+    """
+    device = device or pick_device()
+    log = progress if progress is not None else print
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    model = build_model(num_classes=len(CLASSES)).to(device)
+    optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs)
+    criterion = nn.CrossEntropyLoss()
+
+    history: dict[str, list[float]] = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_accuracy": [],
+        "val_balanced_accuracy": [],
+        "val_macro_f1": [],
+    }
+    best_macro_f1 = -float("inf")
+    best_state: Optional[dict[str, torch.Tensor]] = None
+    best_metrics: Optional[dict[str, float]] = None
+    patience_counter = 0
+
+    for epoch in range(cfg.epochs):
+        model.train()
+        running_loss = 0.0
+        n_samples = 0
+        for x, y in train_loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * x.size(0)
+            n_samples += x.size(0)
+        train_loss = running_loss / max(n_samples, 1)
+
+        model.eval()
+        running_loss = 0.0
+        n_samples = 0
+        pred_chunks: list[np.ndarray] = []
+        true_chunks: list[np.ndarray] = []
+        with torch.no_grad():
+            for x, y in val_loader:
+                x = x.to(device, non_blocking=True)
+                y_dev = y.to(device, non_blocking=True)
+                logits = model(x)
+                loss = criterion(logits, y_dev)
+                running_loss += loss.item() * x.size(0)
+                n_samples += x.size(0)
+                pred_chunks.append(logits.argmax(1).cpu().numpy())
+                true_chunks.append(y.numpy())
+        val_loss = running_loss / max(n_samples, 1)
+        y_pred = np.concatenate(pred_chunks)
+        y_true = np.concatenate(true_chunks)
+        metrics = _batch_metrics(y_true, y_pred)
+
+        scheduler.step()
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["val_accuracy"].append(metrics["accuracy"])
+        history["val_balanced_accuracy"].append(metrics["balanced_accuracy"])
+        history["val_macro_f1"].append(metrics["macro_f1"])
+
+        log(
+            f"  ep {epoch + 1:3d}/{cfg.epochs}  "
+            f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+            f"val_acc={metrics['accuracy']:.3f}  val_macroF1={metrics['macro_f1']:.3f}"
+        )
+
+        if metrics["macro_f1"] > best_macro_f1:
+            best_macro_f1 = metrics["macro_f1"]
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_metrics = metrics
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= cfg.patience:
+                log(f"  early stopping at epoch {epoch + 1} (no val improvement for {cfg.patience} epochs)")
+                break
+
+    return {
+        "history": history,
+        "best_state": best_state,
+        "best_metrics": best_metrics,
+    }
+
+
+def run_cv(
+    paths: Sequence[PathLike],
+    labels: Sequence[int],
+    cfg: TrainConfig,
+    transform_builder: Callable[[int], Callable] = build_train_transforms,
+    eval_transform_builder: Optional[Callable[[int], Callable]] = None,
+    device: Optional[torch.device] = None,
+    progress: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    """Run Stratified K-fold CV. Returns per-fold results, summary stats, and split indices.
+
+    ``transform_builder`` builds the training transform; ``eval_transform_builder`` builds
+    the per-epoch validation transform (a single-tile, deterministic pipeline). If
+    ``eval_transform_builder`` is not given, the default :func:`build_eval_transforms` is
+    used — which matches ``transform_builder=build_train_transforms``.
+    """
+    device = device or pick_device()
+    log = progress if progress is not None else print
+    eval_builder = eval_transform_builder or build_eval_transforms
+    y = np.asarray(labels)
+
+    skf = StratifiedKFold(n_splits=cfg.n_splits, shuffle=True, random_state=cfg.seed)
+    fold_results: list[dict[str, Any]] = []
+    splits: list[dict[str, list[int]]] = []
+
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(np.arange(len(paths)), y)):
+        log(f"\n=== Fold {fold_idx + 1}/{cfg.n_splits}  (train={len(train_idx)}, val={len(val_idx)}) ===")
+        set_seed(cfg.seed + fold_idx)
+
+        train_ds = TissueDataset(
+            [paths[i] for i in train_idx],
+            [labels[i] for i in train_idx],
+            transform=transform_builder(cfg.crop_size),
+        )
+        val_ds = TissueDataset(
+            [paths[i] for i in val_idx],
+            [labels[i] for i in val_idx],
+            transform=eval_builder(cfg.crop_size),
+        )
+
+        result = train_one_fold(train_ds, val_ds, cfg, device=device, progress=log)
+        result["fold"] = fold_idx
+        fold_results.append(result)
+        splits.append({"train_idx": train_idx.tolist(), "val_idx": val_idx.tolist()})
+
+        log(
+            f"  fold {fold_idx + 1} best: "
+            f"acc={result['best_metrics']['accuracy']:.3f} "
+            f"macroF1={result['best_metrics']['macro_f1']:.3f}"
+        )
+
+    summary_keys = ("accuracy", "balanced_accuracy", "macro_f1")
+    summary = {
+        k: {
+            "mean": float(np.mean([r["best_metrics"][k] for r in fold_results])),
+            "std": float(np.std([r["best_metrics"][k] for r in fold_results])),
+            "per_fold": [r["best_metrics"][k] for r in fold_results],
+        }
+        for k in summary_keys
+    }
+    best_fold = int(np.argmax([r["best_metrics"]["macro_f1"] for r in fold_results]))
+
+    return {
+        "fold_results": fold_results,
+        "summary": summary,
+        "best_fold": best_fold,
+        "splits": splits,
+        "cfg": asdict(cfg),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+
+def save_cv_results(results: dict[str, Any], out_dir: PathLike) -> None:
+    """Persist the outputs of ``run_cv``.
+
+    Writes:
+        - ``final.pt``    — state_dict of the best fold's model.
+        - ``splits.json`` — per-fold train/val indices + best fold index.
+        - ``config.yaml`` — the ``TrainConfig`` used.
+        - ``metrics.json``— per-fold metrics, histories, and summary stats.
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    best_idx = results["best_fold"]
+    best_state = results["fold_results"][best_idx]["best_state"]
+    if best_state is None:
+        raise RuntimeError("best fold has no saved state_dict")
+    torch.save(best_state, out / "final.pt")
+
+    with open(out / "splits.json", "w") as f:
+        json.dump({"best_fold": best_idx, "splits": results["splits"]}, f, indent=2)
+
+    with open(out / "config.yaml", "w") as f:
+        yaml.safe_dump(results["cfg"], f)
+
+    metrics_only = {
+        "summary": results["summary"],
+        "best_fold": best_idx,
+        "fold_metrics": [r["best_metrics"] for r in results["fold_results"]],
+        "fold_histories": [r["history"] for r in results["fold_results"]],
+    }
+    with open(out / "metrics.json", "w") as f:
+        json.dump(metrics_only, f, indent=2)
+
+
+def load_cv_metrics(out_dir: PathLike) -> Optional[dict[str, Any]]:
+    """Load the serialised CV metrics if they exist, else ``None``."""
+    path = Path(out_dir) / "metrics.json"
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return json.load(f)
+
