@@ -21,7 +21,3 @@ logs/
 *.pt
 *.pth
 *.ckpt
-
-# Local reference notebook only — sections are split into their own tracked
-# notebooks (EDA_walkthrough.ipynb, preprocessing_walkthrough.ipynb, ...)
-classification_walkthrough.ipynb
