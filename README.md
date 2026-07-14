@@ -4,6 +4,13 @@ Deep learning pipeline for classifying H&E-stained tissue patches into 4 classes
 around stratified 5-fold cross-validation on a small dataset (n=400) and an ablation
 study comparing preprocessing/augmentation choices.
 
+> **About the classes.** The 4 classes are provided pre-anonymized as `class1`–`class4`,
+> with no semantic labels. Based on the image count, format, and dimensions (400 images,
+> 100/class, H&E-stained, 2048×1536 TIFF), this closely matches the public
+> [ICIAR2018 BACH](https://iciar2018-challenge.grand-challenge.org/Dataset/) breast cancer
+> histology dataset, where the 4 classes represent a malignancy spectrum: **normal, benign,
+> in situ carcinoma, and invasive carcinoma**. The pipeline below treats it as a blind 4-class problem.
+
 **TL;DR**
 
 - **Task.** 4-class H&E tissue classification, *n* = 400 (100 per class), image-level labels at 2048×1536.
